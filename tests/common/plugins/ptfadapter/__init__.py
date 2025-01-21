@@ -1,8 +1,9 @@
 """This module provides ptfadapter fixture to be used by tests to send/receive traffic via PTF ports"""
 import os
 import pytest
+import time
 
-from ptfadapter import PtfTestAdapter
+from .ptfadapter import PtfTestAdapter
 import ptf.testutils
 
 from tests.common import constants
@@ -13,6 +14,7 @@ DEFAULT_PTF_NN_PORT_RANGE = [10900, 11000]
 DEFAULT_DEVICE_NUM = 0
 ETH_PFX = 'eth'
 ETHERNET_PFX = "Ethernet"
+BACKPLANE = 'backplane'
 MAX_RETRY_TIME = 3
 
 
@@ -34,22 +36,18 @@ def override_ptf_functions():
         return ptf.testutils.send_packet(test, port_id, pkt, count=count)
     setattr(ptf.testutils, "send", _send)
 
-
     # Below code is to override the 'dp_poll' function in the ptf.testutils module. This function is called by all
     # the other functions for receiving packets in the ptf.testutils module. Purpose of this overriding is to update
     # the payload of received packet using the same method to match the updated injected packets.
+    origin_dp_poll = ptf.testutils.dp_poll
+
     def _dp_poll(test, device_number=0, port_number=None, timeout=-1, exp_pkt=None):
         update_payload = getattr(test, "update_payload", None)
         if update_payload and callable(update_payload):
             exp_pkt = test.update_payload(exp_pkt)
 
-        result = test.dataplane.poll(
-            device_number=device_number, port_number=port_number,
-            timeout=timeout, exp_pkt=exp_pkt, filters=ptf.testutils.FILTERS
-        )
-        if isinstance(result, test.dataplane.PollSuccess):
-            test.at_receive(result.packet, device_number=result.device, port_number=result.port)
-        return result
+        return origin_dp_poll(test, device_number=device_number, port_number=port_number,
+                              timeout=timeout, exp_pkt=exp_pkt)
     setattr(ptf.testutils, "dp_poll", _dp_poll)
 
 
@@ -68,7 +66,7 @@ def get_ifaces(netdev_output):
         iface = line.split(':')[0].strip()
 
         # Skip not FP interfaces
-        if ETH_PFX not in iface and ETHERNET_PFX not in iface:
+        if ETH_PFX not in iface and ETHERNET_PFX not in iface and BACKPLANE != iface:
             continue
 
         ifaces.append(iface)
@@ -80,14 +78,25 @@ def get_ifaces_map(ifaces, ptf_port_mapping_mode):
     """Get interface map."""
     sub_ifaces = []
     iface_map = {}
+    used_index = set()
+    backplane_exist = False
     for iface in ifaces:
         iface_suffix = iface.lstrip(ETH_PFX)
         if "." in iface_suffix:
             iface_index = int(iface_suffix.split(".")[0])
             sub_ifaces.append((iface_index, iface))
+        elif iface == BACKPLANE:
+            backplane_exist = True
         else:
             iface_index = int(iface_suffix)
             iface_map[iface_index] = iface
+            used_index.add(iface_index)
+
+    count = 1
+    while count in used_index:
+        count = count + 1
+    if backplane_exist:
+        iface_map[count] = "backplane"
 
     if ptf_port_mapping_mode == "use_sub_interface":
         # override those interfaces that has sub interface
@@ -101,7 +110,7 @@ def get_ifaces_map(ifaces, ptf_port_mapping_mode):
 
 
 @pytest.fixture(scope='module')
-def ptfadapter(ptfhost, tbinfo, request):
+def ptfadapter(ptfhost, tbinfo, request, duthost):
     """return ptf test adapter object.
     The fixture is module scope, because usually there is not need to
     restart PTF nn agent and reinitialize data plane thread on every
@@ -111,7 +120,8 @@ def ptfadapter(ptfhost, tbinfo, request):
     """
     # get ptf port mapping mode
     if 'backend' in tbinfo['topo']['name']:
-        ptf_port_mapping_mode = getattr(request.module, "PTF_PORT_MAPPING_MODE", constants.PTF_PORT_MAPPING_MODE_DEFAULT)
+        ptf_port_mapping_mode = getattr(request.module, "PTF_PORT_MAPPING_MODE",
+                                        constants.PTF_PORT_MAPPING_MODE_DEFAULT)
     else:
         ptf_port_mapping_mode = 'use_orig_interface'
 
@@ -142,18 +152,31 @@ def ptfadapter(ptfhost, tbinfo, request):
             ptfhost.command('supervisorctl restart ptf_nn_agent')
 
             # check whether ptf_nn_agent starts successfully
-            if "RUNNING" in ptfhost.command('supervisorctl status ptf_nn_agent', module_ignore_errors=True)["stdout_lines"][0]:
+            if "RUNNING" in ptfhost.command('supervisorctl status ptf_nn_agent',
+                                            module_ignore_errors=True)["stdout_lines"][0]:
                 return ptf_nn_port
         return None
 
     ptf_nn_agent_port = start_ptf_nn_agent()
     assert ptf_nn_agent_port is not None
 
-    with PtfTestAdapter(tbinfo['ptf_ip'], ptf_nn_agent_port, 0, ifaces_map.keys(), ptfhost) as adapter:
+    def check_if_use_minigraph_from_tbinfo(tbinfo):
+        if 'properties' in tbinfo['topo'] and "init_cfg_profile" in tbinfo['topo']['properties']:
+            #
+            # Since init_cfg_profile is used, this topology would not use minigraph
+            #
+            return False
+        return True
+
+    with PtfTestAdapter(tbinfo['ptf_ip'], ptf_nn_agent_port, 0, list(ifaces_map.keys()), ptfhost) as adapter:
         if not request.config.option.keep_payload:
             override_ptf_functions()
             node_id = request.module.__name__
             adapter.payload_pattern = node_id + " "
+
+        adapter.duthost = duthost
+        if check_if_use_minigraph_from_tbinfo(tbinfo):
+            adapter.mg_facts = duthost.get_extended_minigraph_facts(tbinfo)
 
         yield adapter
 
@@ -165,7 +188,7 @@ def nbr_device_numbers(nbrhosts):
     numbers = sorted(nbrhosts.keys())
     device_numbers = {
         nbr_name: numbers.index(nbr_name) + DEFAULT_DEVICE_NUM + 1
-        for nbr_name in nbrhosts.keys()}
+        for nbr_name in list(nbrhosts.keys())}
     return device_numbers
 
 
@@ -175,14 +198,15 @@ def nbr_ptfadapter(request, nbrhosts, nbr_device_numbers, ptfadapter):
     Start the ptf nn services in neighbor devices and register them in ptfadapter.
     """
     if request.config.getoption("--neighbor_type") != "sonic":
-        pytest.fail("Neighbor devices aren't SONiC so that the ptf nn service cannot be started")
+        pytest.skip("Neighbor devices aren't SONiC so that the ptf nn service cannot be started")
     device_sockets = ptf.config['device_sockets']
     current_file_dir = os.path.dirname(os.path.realpath(__file__))
-    for name, attr in nbrhosts.items():
+    for name, attr in list(nbrhosts.items()):
         host = attr["host"]
         res = host.command('cat /proc/net/dev')
         ifaces = get_ifaces(res['stdout'])
-        ifaces_map = {int(ifname.replace(ETHERNET_PFX, '')): ifname for ifname in ifaces if ifname.startswith(ETHERNET_PFX)}
+        ifaces_map = {int(ifname.replace(ETHERNET_PFX, '')):
+                      ifname for ifname in ifaces if ifname.startswith(ETHERNET_PFX)}
 
         def start_ptf_nn_agent():
             for i in range(MAX_RETRY_TIME):
@@ -194,13 +218,17 @@ def nbr_ptfadapter(request, nbrhosts, nbr_device_numbers, ptfadapter):
                         'ifaces_map': ifaces_map,
                     })
                 host.template(src=os.path.join(current_file_dir, 'templates/ptf_nn_agent.conf.ptf.j2'),
-                            dest='/tmp/ptf_nn_agent.conf')
+                              dest='/tmp/ptf_nn_agent.conf')
                 host.shell('docker rm -f ptf || true')
-                host.shell('docker run -dt --network=host --rm --name ptf -v /tmp/ptf_nn_agent.conf:/etc/supervisor/conf.d/ptf_nn_agent.conf docker-ptf')
+                host.shell('docker run -dt --network=host --rm --name ptf -v '
+                           '/tmp/ptf_nn_agent.conf:/etc/supervisor/conf.d/ptf_nn_agent.conf docker-ptf')
 
-                #Maybe the threads in this docker are not ready and may return None
-                if "RUNNING" in host.shell('docker exec ptf supervisorctl status ptf_nn_agent')["stdout_lines"][0]:
-                    return ptf_nn_port
+                # Maybe the threads in this docker are not ready and may return None
+                for j in range(MAX_RETRY_TIME):
+                    time.sleep(1)
+                    if "RUNNING" in host.shell('docker exec ptf supervisorctl status ptf_nn_agent',
+                                               module_ignore_errors=True)["stdout_lines"][0]:
+                        return ptf_nn_port
             return None
 
         ptf_nn_agent_port = start_ptf_nn_agent()

@@ -1,24 +1,28 @@
 
 import pytest
-import ptf.packet as scapy
 import ptf.testutils as testutils
-from ptf.mask import Mask
 
-import itertools
 import logging
-import ipaddress
 import pprint
 
-from tests.common.fixtures.ptfhost_utils import change_mac_addresses        # lgtm[py/unused-import]
-from tests.common.dualtor.mux_simulator_control import toggle_all_simulator_ports_to_rand_selected_tor  # lgtm[py/unused-import]
-from tests.common.fixtures.duthost_utils import ports_list, vlan_ports_list
+from tests.common.fixtures.ptfhost_utils import change_mac_addresses    # noqa F401
 from tests.common.helpers.assertions import pytest_require
-
+from tests.common.fixtures.duthost_utils import utils_vlan_intfs_dict_orig          # noqa F401
+from tests.common.fixtures.duthost_utils import utils_vlan_intfs_dict_add           # noqa F401
+from tests.common.helpers.backend_acl import apply_acl_rules, bind_acl_table        # noqa F401
+from tests.common.fixtures.duthost_utils import ports_list   # noqa F401
+from tests.common.helpers.portchannel_to_vlan import setup_acl_table  # noqa F401
+from tests.common.helpers.portchannel_to_vlan import acl_rule_cleanup  # noqa F401
+from tests.common.helpers.portchannel_to_vlan import vlan_intfs_dict  # noqa F401
+from tests.common.helpers.portchannel_to_vlan import setup_po2vlan    # noqa F401
+from tests.common.fixtures.ptfhost_utils import remove_ip_addresses   # noqa F401
+from tests.common.helpers.portchannel_to_vlan import running_vlan_ports_list
+from tests.common.utilities import wait_until
 
 logger = logging.getLogger(__name__)
 
 pytestmark = [
-    pytest.mark.topology('t0', 't0-56-po2vlan')
+    pytest.mark.topology('t0', 'm0', 'mx')
 ]
 
 PTF_PORT_MAPPING_MODE = "use_orig_interface"
@@ -36,14 +40,14 @@ def skip_dualtor(tbinfo):
 @pytest.fixture(scope="module")
 def cfg_facts(duthosts, rand_one_dut_hostname, skip_dualtor):
     duthost = duthosts[rand_one_dut_hostname]
-    return duthost.config_facts(host=duthost.hostname, source="persistent")['ansible_facts']
+    return duthost.config_facts(host=duthost.hostname, source="running")['ansible_facts']
 
 
 def enable_arp(duthost, cfg_facts, enable):
     vlan_members = cfg_facts.get('VLAN_MEMBER', {})
     on_cmd = "echo 1 > /proc/sys/net/ipv4/conf/%s/arp_accept"
     off_cmd = "echo 0 > /proc/sys/net/ipv4/conf/%s/arp_accept"
-    for vlan in vlan_members.keys():
+    for vlan in list(vlan_members.keys()):
         if enable:
             logger.info("Enable ARP for %s" % vlan)
             duthost.shell(on_cmd % vlan)
@@ -58,7 +62,8 @@ def arp_cleanup(duthost):
 
 
 @pytest.fixture(scope="module", autouse=True)
-def setup_arp(duthosts, rand_one_dut_hostname, cfg_facts):
+def setup_arp(duthosts, rand_one_dut_hostname, ptfhost, rand_selected_dut, ptfadapter,
+                ports_list, tbinfo, vlan_intfs_dict, setup_acl_table, setup_po2vlan, cfg_facts):  # noqa F811
     duthost = duthosts[rand_one_dut_hostname]
     # --------------------- Setup -----------------------
     try:
@@ -71,71 +76,61 @@ def setup_arp(duthosts, rand_one_dut_hostname, cfg_facts):
         arp_cleanup(duthost)
 
 
-def build_arp_packet(vlan_id, neighbor_mac, neighbor_ip):
+def build_arp_packet(vlan_id, neighbor_mac, dst_mac, neighbor_ip):
 
     pkt = testutils.simple_arp_packet(pktlen=60 if vlan_id == 0 else 64,
-            eth_dst='ff:ff:ff:ff:ff:ff',
-            eth_src=neighbor_mac,
-            vlan_vid=vlan_id,
-            arp_op=2,
-            hw_snd=neighbor_mac,
-            ip_snd=neighbor_ip,
-            ip_tgt=neighbor_ip)
+                                      eth_dst=dst_mac,
+                                      eth_src=neighbor_mac,
+                                      vlan_vid=vlan_id,
+                                      arp_op=2,
+                                      hw_snd=neighbor_mac,
+                                      ip_snd=neighbor_ip,
+                                      ip_tgt=neighbor_ip)
     return pkt
 
 
-def verify_packets_with_portchannel(test, pkt, ports=[], portchannel_ports=[], device_number=0, timeout=1):
-    for port in ports:
-        result = testutils.dp_poll(test, device_number=device_number, port_number=port,
-                                   timeout=timeout, exp_pkt=pkt)
-        if isinstance(result, test.dataplane.PollFailure):
-            test.fail("Expected packet was not received on device %d, port %r.\n%s"
-                    % (device_number, port, result.format()))
+def _check_arp_entries(duthost, dummy_ips, dummy_macs, vlan_port_dev, permit_vlanid, error):
+    error["detail"] = None
+    try:
+        res = duthost.command('show arp')
+        assert res['rc'] == 0
+        logger.info('"show arp" output on DUT:\n{}'.format(pprint.pformat(res['stdout_lines'])))
 
-    for port_group in portchannel_ports:
-        for port in port_group:
-            result = testutils.dp_poll(test, device_number=device_number, port_number=port,
-                                       timeout=timeout, exp_pkt=pkt)
-            if isinstance(result, test.dataplane.PollSuccess):
-                break
-        else:
-            test.fail("Expected packet was not received on device %d, ports %s.\n"
-                    % (device_number, str(port_group)))
-
-
-def verify_arp_packets(ptfadapter, vlan_ports_list, vlan_port, vlan_id, untagged_pkt, masked_tagged_pkt):
-    untagged_dst_ports = []
-    tagged_dst_ports = []
-    untagged_dst_pc_ports = []
-    tagged_dst_pc_ports = []
-    logger.info("Verify packets from ports " + str(vlan_port["port_index"][0]))
-    for port in vlan_ports_list:
-        if vlan_port["port_index"] == port["port_index"]:
-            # Skip src port
-            continue
-        if port["pvid"] == vlan_id:
-            if len(port["port_index"]) > 1:
-                untagged_dst_pc_ports.append(port["port_index"])
+        arp_cnt = 0
+        for arp_entry in res['stdout_lines']:
+            # Address MacAddress Iface Vlan
+            items = arp_entry.split()
+            if len(items) != 4:
+                continue
+            # Vlan must be number
+            if not items[3].isdigit():
+                continue
+            arp_cnt += 1
+            ip = items[0]
+            mac = items[1]
+            ifname = items[2]
+            vlan_id = int(items[3])
+            assert ip in dummy_ips
+            assert mac in dummy_macs
+            # 'show arp' command gets iface from FDB table,
+            # if 'show arp' command was earlier than FDB table update, ifname would be '-'
+            if ifname == '-':
+                logger.info('Ignore unknown iface...')
             else:
-                untagged_dst_ports += port["port_index"]
-        elif vlan_id in map(int, port["permit_vlanid"]):
-            if len(port["port_index"]) > 1:
-                tagged_dst_pc_ports.append(port["port_index"])
-            else:
-                tagged_dst_ports += port["port_index"]
-
-    verify_packets_with_portchannel(test=ptfadapter,
-                                    pkt=untagged_pkt,
-                                    ports=untagged_dst_ports,
-                                    portchannel_ports=untagged_dst_pc_ports)
-    verify_packets_with_portchannel(test=ptfadapter,
-                                    pkt=masked_tagged_pkt,
-                                    ports=tagged_dst_ports,
-                                    portchannel_ports=tagged_dst_pc_ports)
+                assert ifname == vlan_port_dev
+            assert vlan_id == permit_vlanid
+        assert arp_cnt == DUMMY_ARP_COUNT, "Expect {} entries, but {} found".format(DUMMY_ARP_COUNT, arp_cnt)
+        return True
+    except Exception as detail:
+        error["detail"] = detail
+        logger.error("Except: {}".format(error["detail"]))
+        raise
 
 
 @pytest.mark.bsl
-def test_tagged_arp_pkt(ptfadapter, vlan_ports_list, duthosts, rand_one_dut_hostname, toggle_all_simulator_ports_to_rand_selected_tor):
+@pytest.mark.po2vlan
+def test_tagged_arp_pkt(ptfadapter, duthosts, rand_one_dut_hostname,
+                        rand_selected_dut, tbinfo, ports_list):  # noqa F811
     """
     Send tagged GARP packets from each port.
     Verify packets egress without tag from ports whose PVID same with ingress port.
@@ -143,54 +138,38 @@ def test_tagged_arp_pkt(ptfadapter, vlan_ports_list, duthosts, rand_one_dut_host
     verify show arp command on DUT.
     """
     duthost = duthosts[rand_one_dut_hostname]
+    router_mac = duthost.facts['router_mac']
+    vlan_ports_list = running_vlan_ports_list(duthosts, rand_one_dut_hostname, rand_selected_dut, tbinfo, ports_list)
     for vlan_port in vlan_ports_list:
         port_index = vlan_port["port_index"][0]
         # Send GARP packets to switch to populate the arp table with dummy MACs for each port
         # Totally 10 dummy MACs for each port, send 1 packet for each dummy MAC
         # ARP table will be cleaned up before each iteration, so there won't be any conflict MAC and IP
-        dummy_macs = ['{}:{:02x}:{:02x}'.format(DUMMY_MAC_PREFIX, port_index&0xFF, i+1)
+        dummy_macs = ['{}:{:02x}:{:02x}'.format(DUMMY_MAC_PREFIX, port_index & 0xFF, i + 1)
                       for i in range(DUMMY_ARP_COUNT)]
-        dummy_ips = ['{}.{:d}.{:d}'.format(DUMMY_IP_PREFIX, port_index&0xFF, i+1)
-                      for i in range(DUMMY_ARP_COUNT)]
+        dummy_ips = ['{}.{:d}.{:d}'.format(DUMMY_IP_PREFIX, port_index & 0xFF, i + 1)
+                     for i in range(DUMMY_ARP_COUNT)]
         for permit_vlanid in map(int, vlan_port["permit_vlanid"]):
             logger.info('Test ARP: interface %s, VLAN %u' % (vlan_port["dev"], permit_vlanid))
             # Perform ARP clean up
             arp_cleanup(duthost)
             for i in range(DUMMY_ARP_COUNT):
-                pkt = build_arp_packet(permit_vlanid, dummy_macs[i], dummy_ips[i])
-                exp_untagged_pkt = build_arp_packet(0, dummy_macs[i], dummy_ips[i])
-                # vlan priority attached to packets is determined by the port, so we ignore it here
-                exp_tagged_pkt = Mask(pkt)
-                exp_tagged_pkt.set_do_not_care_scapy(scapy.Dot1Q, "prio")
+                pkt = build_arp_packet(permit_vlanid, dummy_macs[i], router_mac, dummy_ips[i])
                 logger.info("Send tagged({}) packet from {} ...".format(permit_vlanid, port_index))
                 testutils.send(ptfadapter, port_index, pkt)
-                verify_arp_packets(ptfadapter, vlan_ports_list, vlan_port, permit_vlanid, exp_untagged_pkt, exp_tagged_pkt)
-
-            res = duthost.command('show arp')
-            assert res['rc'] == 0
-            logger.info('"show arp" output on DUT:\n{}'.format(pprint.pformat(res['stdout_lines'])))
-
-            arp_cnt = 0
-            for l in res['stdout_lines']:
-                # Address MacAddress Iface Vlan
-                items = l.split()
-                if len(items) != 4:
-                    continue
-                # Vlan must be number
-                if not items[3].isdigit():
-                    continue
-                arp_cnt += 1
-                ip = items[0]
-                mac = items[1]
-                ifname = items[2]
-                vlan_id = int(items[3])
-                assert ip in dummy_ips
-                assert mac in dummy_macs
-                # 'show arp' command gets iface from FDB table,
-                # if 'show arp' command was earlier than FDB table update, ifname would be '-'
-                if ifname == '-':
-                    logger.info('Ignore unknown iface...')
-                else:
-                    assert ifname == vlan_port["dev"]
-                assert vlan_id == permit_vlanid
-            assert arp_cnt == DUMMY_ARP_COUNT
+            error = {"detail": None}
+            wait_until(180, 60, 0, _check_arp_entries, duthost, dummy_ips, dummy_macs, vlan_port["dev"], permit_vlanid,
+                       error)
+            if error["detail"] is not None:
+                # Dump status for debug
+                import time
+                time.sleep(10)
+                res = duthost.command('show mac')
+                logger.info('"show mac" output on DUT:\n{}'.format(pprint.pformat(res['stdout_lines'])))
+                res = duthost.command('show arp')
+                logger.info('"show arp" output on DUT:\n{}'.format(pprint.pformat(res['stdout_lines'])))
+                res = duthost.command('show int counter')
+                logger.info('"show int counter" output on DUT:\n{}'.format(pprint.pformat(res['stdout_lines'])))
+                res = duthost.command('show int portchannel')
+                logger.info('"show int portchannel" output on DUT:\n{}'.format(pprint.pformat(res['stdout_lines'])))
+                raise error["detail"]

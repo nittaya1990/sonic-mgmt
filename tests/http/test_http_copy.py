@@ -5,7 +5,7 @@ from tests.common.helpers.assertions import pytest_assert
 
 pytestmark = [
     pytest.mark.disable_loganalyzer,
-    pytest.mark.topology("any"),
+    pytest.mark.topology("any", "t1-multi-asic"),
     pytest.mark.device_type("vs"),
 ]
 
@@ -13,11 +13,10 @@ SONIC_SSH_PORT = 22
 SONIC_SSH_REGEX = "OpenSSH_[\\w\\.]+ Debian"
 HTTP_PORT = "8080"
 
+
 def test_http_copy(duthosts, rand_one_dut_hostname, ptfhost):
     """Test that HTTP (copy) can be used to download objects to the DUT"""
 
-    pytest.skip("---- test doesn't clean up the files in /tmp, it will cause the subsequent cases in /tmp fail,"
-                "skipping until the issue is addressed ----")
     duthost = duthosts[rand_one_dut_hostname]
     ptf_ip = ptfhost.mgmt_ip
 
