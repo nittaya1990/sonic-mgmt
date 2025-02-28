@@ -1,8 +1,8 @@
 # Conditional Mark
 
-This is a plugin for adding any mark to specified test cases based on conditions in a centralized file.
+This is a plugin for adding any mark to specified test cases based on conditions in mark conditions files.
 
-The centralized file can be supplied in pytest command line option `--mark-conditions-file`. If no conditions file is specified, use the default conditions file located at `tests/common/plugins/conditional_mark/test_mark_conditions.yaml`.
+The mark conditions files can be supplied in pytest command line option `--mark-conditions-files`. If no conditions file is specified, use the default conditions file located at `tests/common/plugins/conditional_mark/test_mark_conditions.yaml`.
 
 
 ## How it works
@@ -12,7 +12,28 @@ This plugin works at the collection stage of pytest. It mainly uses two pytest h
 
 In `pytest_collection` hook function, it reads the specified conditions file and collect some basic facts that can be used in condition evaluation. The loaded information is stored in pytest object `session.config.cache`.
 
-In `pytest_collection_modifyitems`, it checks each collected test item (test case). For each item, it searches for the longest match test case name defined in the conditions content. If a match is found, then it will add the marks specified for this case based on conditions for each of the marks.
+In `pytest_collection_modifyitems`, each collected test item (test case) is examined.
+For each item, all potential matching conditions found based on the test case name are identified.
+If a match is found and its mark is unique across all matches, the corresponding mark will be added to the test case.
+If there are multiple matches, the mark from the longest match which conditions are True is used.
+This means that if the conditions in the longest matching entry are False, we will backtrack to find the longest matching entry with conditions that are True.
+Different marks across multiple files are allowed.
+
+
+## How to use `--mark-conditions-files`
+`--mark-conditions-files` supports exactly file name such as `tests/common/plugins/conditional_mark/test_mark_conditions.yaml` or the pattern of the file name such as `tests/common/plugins/conditional_mark/test_mark_conditions*.yaml` which will collect all files under the path `tests/common/plugins/conditional_mark` named as `test_mark_conditions*.yaml`.
+It can be supplied multiple times to specify multiple condition files.
+
+For example:
+```buildoutcfg
+./run_tests.sh -n vms-kvm-t0 -d vlab-01 -c ssh/test_ssh_stress.py -f vtestbed.yaml -i ../ansible/veos_vtb -u -l INFO -e "--mark-conditions-files path1/test1.yaml" -e "--mark-conditions-files path2/test2.yaml"
+```
+or
+```buildoutcfg
+./run_tests.sh -n vms-kvm-t0 -d vlab-01 -c ssh/test_ssh_stress.py -f vtestbed.yaml -i ../ansible/veos_vtb -u -l INFO -e "--mark-conditions-files path1/{pattern}.yaml"
+```
+
+
 
 ## Format of the conditions file
 
@@ -30,8 +51,8 @@ folder1/test_file1.py::test_case1:
     reason: "skip file1/case1"
     conditions:
       - "release in ['master'] or asic_type=='vs'"
-      - https://github.com/Azure/sonic-mgmt/issues/1234
-      - https://github.com/Azure/sonic-mgmt/issues/1235
+      - https://github.com/sonic-net/sonic-mgmt/issues/1234
+      - https://github.com/sonic-net/sonic-mgmt/issues/1235
 folder1/test_file1.py::test_case2[2+4-6]:
   skip:
     reason: "test file1/case2[2+4-6] skip"
@@ -42,7 +63,7 @@ folder2/test_file2.py::TestMarkers::test_case1:
   xfail:
     reason: "test file2/case1 xfail"
     conditions:
-      - https://github.com/Azure/sonic-mgmt/issues/1235 and topo_name == 't1-lag'
+      - https://github.com/sonic-net/sonic-mgmt/issues/1235 and topo_name == 't1-lag'
       -              # Empty condition will be ignored. Equivalent to True.
 folder2/test_file2.py::TestMarkers::test_case2:
   xfail:
@@ -58,9 +79,12 @@ folder3:
     reason: "Skip all the test scripts under subfolder 'folder3'"
 ```
 
-## Longest match rule
+## Match rule
 
-This plugin process each expanded (for parametrized test cases) test cases one by one. For each test case, the marks specified in the longest match entry in the conditions file will take precedence.
+This plugin process each expanded (for parametrized test cases) test cases one by one.
+For each test case, it will get all potential matches that match the pattern of test case name.
+And then, for each match, if the mark in it is unique across all matches, and the conditions in this mark are True, we will add this mark to test case based on conditions.
+Otherwise, we will use the mark which belongs to the longest match which conditions are True.
 
 Then we can easily apply a set of marks for specific test case in a script file and another set of marks for rest of the test cases in the same script file.
 
@@ -72,10 +96,14 @@ feature_a/test_file_1.py:
     conditions:
       - "release in ['201911']"
 feature_a/test_file_1.py::testcase_3:
-  xfail:
-    reason: "testcase_i are suppose to fail because an issue"
+  skip:
+    reason: "testcase_3 should be skipped for 202311 image"
     conditions:
-      - https://github.com/Azure/sonic-mgmt/issues/1234
+      - "release in ['202311']"
+  xfail:
+    reason: "testcase_3 are suppose to fail because an issue"
+    conditions:
+      - https://github.com/sonic-net/sonic-mgmt/issues/1234
 ```
 
 And assume we have below test script:
@@ -88,10 +116,12 @@ def testcase_2
 
 def testcase_3
 ```
-In this example, `testcase_1` and `testcase_2` will have nodeid like `feature_a/test_file_1.py::testcase_1` and `feature_a/test_file_1.py::testcase_2`. They will match entry `feature_a/test_file_1.py`. So, the `skip` mark will be added to `testcase_1` and `testcase_2` when `release in ['201911']`.
-For `testcase_3`, its nodeid will be `feature_a/test_file_1.py::testcase_3`. Then it will only match `feature_a/test_file_1.py::testcase_3`. The `xfail` mark will be added to `testcase_3` when the Github issue is still open. Entry `feature_a/test_file_1.py` also matches its nodeid. But, because it is not the longest match, it will simply be ignored.
+In this example, `testcase_1` and `testcase_2` will have nodeid like `feature_a/test_file_1.py::testcase_1` and `feature_a/test_file_1.py::testcase_2`.
+They will match entry `feature_a/test_file_1.py`. So, the `skip` mark will be added to `testcase_1` and `testcase_2` when `release in ['201911']`.
 
-In a summary, under such scenario, the `skip` mark will be conditionally added to `testcase_1` and `testcase_2`. The `xfail` mark will be conditionally added to `testcase_3`.
+For `testcase_3`, its nodeid will be `feature_a/test_file_1.py::testcase_3`. It will match both `feature_a/test_file_1.py` and `feature_a/test_file_1.py::testcase_3`.
+For mark `xfail`, it is the only mark in all matches, so it will be added to `testcase_3` when the Github issue is still open.
+And for mark `skip`, it exists in multiple matches. We will use the longest match of this match, which is under the entry `feature_a/test_file_1.py::testcase_3`.
 
 If a test case is parameterized, we can even specify different mark for different parameter value combinations for the same test case.
 
@@ -103,7 +133,7 @@ Example variables can be used in condition string:
       "commit_id": "db529af20",
       "build_date": "Mon Sep 13 17:41:03 UTC 2021",
       "sonic_utilities": 1.2,
-      "kernel_version": "4.19.0-12-2-amd64",
+      "kernel_version": "4.19.0",
       "debian_version": "10.10",
       "built_by": "AzDevOps@sonic-build-workers-000OU4",
       "libswsscommon": "1.0.0",
@@ -111,13 +141,34 @@ Example variables can be used in condition string:
       "branch": "master",
       "release": "master",
       "topo_type": "t0",
-      "topo_name": "t0"
+      "topo_name": "t0",
       "platform": "x86_64-kvm_x86_64-r0",
       "hwsku": "Force10-S6000",
       "build_number": 36262,
       "asic_type": "vs",
       "num_asic": 1,
       "is_multi_asic": False,
+      "feature_status": {
+        "lldp": "enabled",
+        "pmon": "enabled",
+        "sflow": "disabled",
+        "database": "always_enabled",
+        "radv": "enabled",
+        "macsec": "disabled",
+        "telemetry": "enabled",
+        "snmp": "enabled",
+        "mux": "always_disabled",
+        "bgp": "enabled",
+        "dhcp_relay": "enabled",
+        "mgmt-framework": "enabled",
+        "nat": "disabled",
+        "teamd": "enabled",
+        "gbsyncd": "enabled",
+        "syncd": "enabled",
+        "swss": "enabled"
+      },
+      "asic_gen": "td2",
+      "is_supervisor": False
     }
 ```
 
@@ -125,10 +176,10 @@ Example variables can be used in condition string:
 A new pytest command line option is added for specifying location of the conditions file. If the option is not supplied, default conditions file located at `tests/common/plugins/conditional_mark/test_mark_conditions.yaml` will be used.
 ```
     parser.addoption(
-        '--mark-conditions-file',
-        action='store',
-        dest='mark_conditions_file',
-        default='',
+        '--mark-conditions-files',
+        action='append',
+        dest='mark_conditions_files',
+        default=[],
         help="Location of your own mark conditions file. If it is not specified, the default file will be used.")
 
     parser.addoption(

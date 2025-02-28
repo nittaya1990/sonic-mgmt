@@ -1,76 +1,127 @@
-import crypt
+import binascii
 import logging
-
-from tests.common.utilities import wait_until
+import pytest
+import paramiko
+import time
 from tests.common.helpers.assertions import pytest_assert
+from tests.common.helpers.tacacs.tacacs_helper import start_tacacs_server
+from tests.common.utilities import wait_until, paramiko_ssh
+from ansible.errors import AnsibleConnectionFailure
 
 logger = logging.getLogger(__name__)
 
-def check_output(output, exp_val1, exp_val2):
-    pytest_assert(not output['failed'], output['stderr'])
-    for l in output['stdout_lines']:
-        fds = l.split(':')
-        if fds[0] == exp_val1:
-            pytest_assert(fds[4] == exp_val2)
+TIMEOUT_LIMIT = 120
 
-def check_all_services_status(ptfhost):
-    res = ptfhost.command("service --status-all")
-    logger.info(res["stdout_lines"])
+DEVICE_UNREACHABLE_MAX_RETRIES = 3
 
 
-def start_tacacs_server(ptfhost):
-    ptfhost.command("service tacacs_plus restart", module_ignore_errors=True)
-    return "tacacs+ running" in ptfhost.command("service tacacs_plus status", module_ignore_errors=True)["stdout_lines"]
+@pytest.fixture
+def ensure_tacacs_server_running_after_ut(duthosts, enum_rand_one_per_hwsku_hostname):
+    """make sure tacacs server running after UT finish"""
+    duthost = duthosts[enum_rand_one_per_hwsku_hostname]
+
+    yield
+
+    start_tacacs_server(duthost)
 
 
-def setup_tacacs_client(duthost, creds_all_duts, tacacs_server_ip):
-    """setup tacacs client"""
+def check_server_received(ptfhost, data, timeout=30):
+    """
+        Check if tacacs server received the data.
+    """
+    hex = binascii.hexlify(data.encode('ascii'))
+    hex_string = hex.decode()
 
-    # configure tacacs client
-    duthost.shell("sudo config tacacs passkey %s" % creds_all_duts[duthost]['tacacs_passkey'])
+    """
+      Extract received data from tac_plus.log, then use grep to check if the received data contains hex_string:
+            1. tac_plus server start with '-d 2058' parameter to log received data in following format in tac_plus.log:
+                    Thu Mar  9 06:26:16 2023 [75483]: data[140] = 0xf8, xor'ed with hash[12] = 0xab -> 0x53
+                    Thu Mar  9 06:26:16 2023 [75483]: data[141] = 0x8d, xor'ed with hash[13] = 0xc2 -> 0x4f
+                In above log, the 'data[140] = 0xf8' is received data.
 
-    # get default tacacs servers
-    config_facts = duthost.config_facts(host=duthost.hostname, source="running")['ansible_facts']
-    for tacacs_server in config_facts.get('TACPLUS_SERVER', {}):
-        duthost.shell("sudo config tacacs delete %s" % tacacs_server)
-    duthost.shell("sudo config tacacs add %s" % tacacs_server_ip)
-    duthost.shell("sudo config tacacs authtype login")
+            2. Following sed command will extract the received data from tac_plus.log:
+                    sed -n 's/.*-> 0x\(..\).*/\\1/p'  /var/log/tac_plus.log     # noqa W605
 
-    # enable tacacs+
-    duthost.shell("sudo config aaa authentication login tacacs+")
+            3. Following set command will join all received data to hex string:
+                    sed ':a; N; $!ba; s/\\n//g'
 
+            4. Then the grep command will check if the received hex data containes expected hex string.
+                    grep '{0}'".format(hex_string)
 
-def setup_tacacs_server(ptfhost, creds_all_duts, duthost):
-    """setup tacacs server"""
+      Also suppress following Flake8 error/warning:
+            W605 : Invalid escape sequence. Flake8 can't handle sed command escape sequence, so will report false alert.
+            E501 : Line too long. Following sed command difficult to split to multiple line.
+    """
+    sed_command = "sed -n 's/.*-> 0x\(..\).*/\\1/p'  /var/log/tac_plus.log | sed ':a; N; $!ba; s/\\n//g' | grep '{0}'".format(hex_string)   # noqa W605 E501
 
-    # configure tacacs server
-    extra_vars = {'tacacs_passkey': creds_all_duts[duthost]['tacacs_passkey'],
-                  'tacacs_rw_user': creds_all_duts[duthost]['tacacs_rw_user'],
-                  'tacacs_rw_user_passwd': crypt.crypt(creds_all_duts[duthost]['tacacs_rw_user_passwd'], 'abc'),
-                  'tacacs_ro_user': creds_all_duts[duthost]['tacacs_ro_user'],
-                  'tacacs_ro_user_passwd': crypt.crypt(creds_all_duts[duthost]['tacacs_ro_user_passwd'], 'abc'),
-                  'tacacs_jit_user': creds_all_duts[duthost]['tacacs_jit_user'],
-                  'tacacs_jit_user_passwd': crypt.crypt(creds_all_duts[duthost]['tacacs_jit_user_passwd'], 'abc'),
-                  'tacacs_jit_user_membership': creds_all_duts[duthost]['tacacs_jit_user_membership']}
+    # After tacplus service receive data, it need take some time to update to log file.
+    def log_exist(ptfhost, sed_command):
+        res = ptfhost.shell(sed_command)
+        logger.info(sed_command)
+        logger.info(res["stdout_lines"])
+        return len(res["stdout_lines"]) > 0
 
-    ptfhost.host.options['variable_manager'].extra_vars.update(extra_vars)
-    ptfhost.template(src="tacacs/tac_plus.conf.j2", dest="/etc/tacacs+/tac_plus.conf")
-    ptfhost.lineinfile(path="/etc/default/tacacs+", line="DAEMON_OPTS=\"-d 10 -l /var/log/tac_plus.log -C /etc/tacacs+/tac_plus.conf\"", regexp='^DAEMON_OPTS=.*')
-    check_all_services_status(ptfhost)
-
-    # FIXME: This is a short term mitigation, we need to figure out why the tacacs+ server does not start
-    # reliably all of a sudden.
-    wait_until(5, 1, 0, start_tacacs_server, ptfhost)
-    check_all_services_status(ptfhost)
+    exist = wait_until(timeout, 1, 0, log_exist, ptfhost, sed_command)
+    pytest_assert(exist, "Not found data: {} in tacplus server log".format(data))
 
 
-def cleanup_tacacs(ptfhost, duthost, tacacs_server_ip):
-    # stop tacacs server
-    ptfhost.service(name="tacacs_plus", state="stopped")
-    check_all_services_status(ptfhost)
+def get_auditd_config_reload_line_count(duthost):
+    res = duthost.shell("sudo journalctl -u auditd --boot --no-pager | grep 'audisp-tacplus re-initializing configuration'") # noqa E501
+    logger.info("aaa config file timestamp {}".format(res["stdout_lines"]))
 
-    # reset tacacs client configuration
-    duthost.shell("sudo config tacacs delete %s" % tacacs_server_ip)
-    duthost.shell("sudo config tacacs default passkey")
-    duthost.shell("sudo config aaa authentication login default")
-    duthost.shell("sudo config aaa authentication failthrough default")
+    return len(res["stdout_lines"])
+
+
+def change_and_wait_aaa_config_update(duthost, command, last_line_count=None, timeout=10):
+    if not last_line_count:
+        last_line_count = get_auditd_config_reload_line_count(duthost)
+
+    duthost.shell(command)
+
+    # After AAA config update, hostcfgd will modify config file and notify auditd reload config
+    # Wait auditd reload config finish
+    def log_exist(duthost):
+        latest_line_count = get_auditd_config_reload_line_count(duthost)
+        return latest_line_count > last_line_count
+
+    exist = wait_until(timeout, 1, 0, log_exist, duthost)
+    pytest_assert(exist, "Not found aaa config update log: {}".format(command))
+
+
+def ssh_run_command(ssh_client, command, expect_exit_code=0, verify=False):
+    stdin, stdout, stderr = ssh_client.exec_command(command, timeout=TIMEOUT_LIMIT)
+    exit_code = stdout.channel.recv_exit_status()
+    if verify is True:
+        pytest_assert(
+            exit_code == expect_exit_code,
+            f"Command: '{command}' failed with exit code: {exit_code}, stdout: {stdout}, stderr: {stderr}")
+    return exit_code, stdout, stderr
+
+
+def ssh_connect_remote_retry(remote_ip, remote_username, remote_password, duthost):
+    retry_count = 3
+    while retry_count > 0:
+        try:
+            return paramiko_ssh(remote_ip, remote_username, remote_password)
+        except paramiko.ssh_exception.AuthenticationException as e:
+            logger.info("Paramiko SSH connect failed with authentication: " + repr(e))
+
+            # get syslog for debug
+            recent_syslog = duthost.shell('sudo tail -100 /var/log/syslog')['stdout']
+            logger.debug("Target device syslog: {}".format(recent_syslog))
+
+        time.sleep(1)
+        retry_count -= 1
+
+
+def duthost_shell_with_unreachable_retry(duthost, command):
+    retries = 0
+    while True:
+        try:
+            return duthost.shell(command)
+        except AnsibleConnectionFailure as e:
+            retries += 1
+            logger.warning("retry_when_dut_unreachable exception： {}, retry {}/{}"
+                           .format(e, retries, DEVICE_UNREACHABLE_MAX_RETRIES))
+            if retries > DEVICE_UNREACHABLE_MAX_RETRIES:
+                raise e

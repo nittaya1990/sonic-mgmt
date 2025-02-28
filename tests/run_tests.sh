@@ -7,11 +7,12 @@ function show_help_and_exit()
     echo "    -h -?          : get this help"
     echo "    -a <True|False>: specify if auto-recover is allowed (default: True)"
     echo "    -b <master_id> : specify name of k8s master group used in k8s inventory, format: k8s_vms{msetnumber}_{servernumber}"
+    echo "    -B             : run BSL test suite"
     echo "    -c <testcases> : specify test cases to execute (default: none, executed all matched)"
     echo "    -d <dut name>  : specify comma-separated DUT names (default: DUT name associated with testbed in testbed file)"
     echo "    -e <parameters>: specify extra parameter(s) (default: none)"
     echo "    -E             : exit for any error (default: False)"
-    echo "    -f <tb file>   : specify testbed file (default testbed.csv)"
+    echo "    -f <tb file>   : specify testbed file (default testbed.yaml)"
     echo "    -i <inventory> : specify inventory name"
     echo "    -I <folders>   : specify list of test folders, filter out test cases not in the folders (default: none)"
     echo "    -k <file log>  : specify file log level: error|warning|info|debug (default debug)"
@@ -37,14 +38,22 @@ function get_dut_from_testbed_file() {
         if [[ $TESTBED_FILE == *.csv ]];
         then
             LINE=`cat $TESTBED_FILE | grep "^$TESTBED_NAME"`
+            if [[ -z ${LINE} ]]; then
+                echo "Unable to find testbed '$TESTBED_NAME' in testbed file '$TESTBED_FILE'"
+                show_help_and_exit 4
+            fi
             IFS=',' read -ra ARRAY <<< "$LINE"
-            DUT_NAME=${ARRAY[9]}
+            DUT_NAME=${ARRAY[9]//[\[\] ]/}
         elif [[ $TESTBED_FILE == *.yaml ]];
         then
-            content=$(python -c "from __future__ import print_function; import yaml; print('+'.join(str(tb) for tb in yaml.safe_load(open('$TESTBED_FILE')) if '$TESTBED_NAME'==tb['conf-name']))")
+            content=$(python3 -c "from __future__ import print_function; import yaml; print('+'.join(str(tb) for tb in yaml.safe_load(open('$TESTBED_FILE')) if '$TESTBED_NAME'==tb['conf-name']))")
+            if [[ -z ${content} ]]; then
+                echo "Unable to find testbed '$TESTBED_NAME' in testbed file '$TESTBED_FILE'"
+                show_help_and_exit 4
+            fi
             IFS=$'+' read -r -a tb_lines <<< $content
             tb_line=${tb_lines[0]}
-            DUT_NAME=$(python -c "from __future__ import print_function; tb=eval(\"$tb_line\"); print(\",\".join(tb[\"dut\"]))")
+            DUT_NAME=$(python3 -c "from __future__ import print_function; tb=eval(\"$tb_line\"); print(\",\".join(tb[\"dut\"]))")
         fi
     fi
 }
@@ -63,9 +72,14 @@ function validate_parameters()
         RET=2
     fi
 
-    if [[ -z ${TOPOLOGY} && -z ${TEST_CASES} ]]; then
-        echo "Neither TOPOLOGY (-t) nor test case list (-c) is set.."
+    if [[ -z ${TOPOLOGY} && -z ${TEST_CASES} && -z ${TEST_CASES_FILE} ]]; then
+        echo "Neither TOPOLOGY (-t) nor test case list (-c) nor test case list file (-F) is set.."
         RET=3
+    fi
+
+    if [[ ${TEST_CASES} && ${TEST_CASES_FILE} ]]; then
+        echo "Specified both a test case list (-c) and a test case list file (-F).."
+        RET=4
     fi
 
     if [[ ${RET} != 0 ]]; then
@@ -83,6 +97,7 @@ function setup_environment()
 
     AUTO_RECOVER="True"
     BYPASS_UTIL="False"
+    BSL="False"
     CLI_LOG_LEVEL='warning'
     EXTRA_PARAMETERS=""
     FILE_LOG_LEVEL='debug'
@@ -93,8 +108,9 @@ function setup_environment()
     RETAIN_SUCCESS_LOG="False"
     SKIP_SCRIPTS=""
     SKIP_FOLDERS="ptftests acstests saitests scripts k8s sai_qualify"
-    TESTBED_FILE="${BASE_PATH}/ansible/testbed.csv"
+    TESTBED_FILE="${BASE_PATH}/ansible/testbed.yaml"
     TEST_CASES=""
+    TEST_FILTER=""
     TEST_INPUT_ORDER="False"
     TEST_METHOD='group'
     TEST_MAX_FAIL=0
@@ -102,6 +118,8 @@ function setup_environment()
     export ANSIBLE_CONFIG=${BASE_PATH}/ansible
     export ANSIBLE_LIBRARY=${BASE_PATH}/ansible/library/
     export ANSIBLE_CONNECTION_PLUGINS=${BASE_PATH}/ansible/plugins/connection
+    export ANSIBLE_CLICONF_PLUGINS=${BASE_PATH}/ansible/cliconf_plugins
+    export ANSIBLE_TERMINAL_PLUGINS=${BASE_PATH}/ansible/terminal_plugins
 
     # Kill pytest and ansible-playbook process
     pkill --signal 9 pytest
@@ -120,11 +138,22 @@ function setup_test_options()
     # for the scenario of specifying test scripts using pattern like `subfolder/test_*.py`. The pattern will be
     # expanded to matched test scripts by bash. Among the expanded scripts, we may want to skip a few. Then we can
     # explicitly specify the script to be skipped.
-    ignores=$(python -c "print '|'.join('''$SKIP_FOLDERS'''.split())")
-    if [[ -z ${TEST_CASES} ]]; then
+    ignores=$(python3 -c "print('|'.join('''$SKIP_FOLDERS'''.split()))")
+    if [[ -z ${TEST_CASES} && -z ${TEST_CASES_FILE} ]]; then
         # When TEST_CASES is not specified, find all the possible scripts, ignore the scripts under $SKIP_FOLDERS
         all_scripts=$(find ./ -name 'test_*.py' | sed s:^./:: | grep -vE "^(${ignores})")
+        ignore_files=("test_pretest.py" "test_posttest.py")
+        for ((i=${#all_scripts[@]}-1; i>=0; i--)); do
+            # Check if the current element is in the sub array
+            if [[ " ${ignore_files[@]} " =~ " ${all_scripts[i]} " ]]; then
+                # Remove the element from the main array
+                unset 'all_scripts[i]'
+            fi
+        done
     else
+        if [[ ${TEST_CASES_FILE} ]]; then
+            TEST_CASES="${TEST_CASES} $(cat ${TEST_CASES_FILE} | tr '\n' ' ')"
+        fi
         # When TEST_CASES is specified, ignore the scripts under $SKIP_FOLDERS
         all_scripts=""
         for test_script in ${TEST_CASES}; do
@@ -133,18 +162,18 @@ function setup_test_options()
     fi
     # Ignore the scripts specified in $SKIP_SCRIPTS
     if [[ x"${TEST_INPUT_ORDER}" == x"True" ]]; then
-        TEST_CASES=$(python -c "print '\n'.join([testcase for testcase in list('''$all_scripts'''.split()) if testcase not in set('''$SKIP_SCRIPTS'''.split())])")
+        TEST_CASES=$(python3 -c "print('\n'.join([testcase for testcase in list('''$all_scripts'''.split()) if testcase not in set('''$SKIP_SCRIPTS'''.split())]))")
     else
-        TEST_CASES=$(python -c "print '\n'.join(set('''$all_scripts'''.split()) - set('''$SKIP_SCRIPTS'''.split()))" | sort)
+        TEST_CASES=$(python3 -c "print('\n'.join(set('''$all_scripts'''.split()) - set('''$SKIP_SCRIPTS'''.split())))" | sort)
     fi
 
     # Check against $INCLUDE_FOLDERS, filter out test cases not in the specified folders
     FINAL_CASES=""
-    includes=$(python -c "print '|'.join('''$INCLUDE_FOLDERS'''.split())")
+    includes=$(python3 -c "print('|'.join('''$INCLUDE_FOLDERS'''.split()))")
     for test_case in ${TEST_CASES}; do
         FINAL_CASES="${FINAL_CASES} $(echo ${test_case} | grep -E "^(${includes})")"
     done
-    TEST_CASES=$(python -c "print '\n'.join('''${FINAL_CASES}'''.split())")
+    TEST_CASES=$(python3 -c "print('\n'.join('''${FINAL_CASES}'''.split()))")
 
     if [[ -z $TEST_CASES ]]; then
         echo "No test case to run based on conditions of '-c', '-I' and '-S'. Please check..."
@@ -174,6 +203,10 @@ function setup_test_options()
             PYTEST_COMMON_OPTS="${PYTEST_COMMON_OPTS} --ignore=${skip}"
         fi
     done
+
+    if [[ ! -z $TEST_FILTER ]]; then
+        PYTEST_COMMON_OPTS="${PYTEST_COMMON_OPTS} -k ${TEST_FILTER}"
+    fi
 
     if [[ -d ${LOG_PATH} ]]; then
         rm -rf ${LOG_PATH}
@@ -215,6 +248,7 @@ function run_debug_tests()
     echo "ANSIBLE_CONFIG:        ${ANSIBLE_CONFIG}"
     echo "ANSIBLE_LIBRARY:       ${ANSIBLE_LIBRARY}"
     echo "AUTO_RECOVER:          ${AUTO_RECOVER}"
+    echo "BSL:                   ${BSL}"
     echo "BYPASS_UTIL:           ${BYPASS_UTIL}"
     echo "CLI_LOG_LEVEL:         ${CLI_LOG_LEVEL}"
     echo "EXTRA_PARAMETERS:      ${EXTRA_PARAMETERS}"
@@ -227,6 +261,8 @@ function run_debug_tests()
     echo "SKIP_SCRIPTS:          ${SKIP_SCRIPTS}"
     echo "SKIP_FOLDERS:          ${SKIP_FOLDERS}"
     echo "TEST_CASES:            ${TEST_CASES}"
+    echo "TEST_CASES_FILE:       ${TEST_CASES_FILE}"
+    echo "TEST_FILTER:           ${TEST_FILTER}"
     echo "TEST_INPUT_ORDER:      ${TEST_INPUT_ORDER}"
     echo "TEST_MAX_FAIL:         ${TEST_MAX_FAIL}"
     echo "TEST_METHOD:           ${TEST_METHOD}"
@@ -240,27 +276,46 @@ function run_debug_tests()
     echo "PYTEST_COMMON_OPTS:    ${PYTEST_COMMON_OPTS}"
 }
 
+# Extra parameters for pre/post test stage
+function pre_post_extra_params()
+{
+    local params=${EXTRA_PARAMETERS}
+    # The enable_macsec option controls the enabling of macsec links of topology.
+    # It aims to verify common test cases work as expected under macsec links.
+    # At pre/post test stage, enabling macsec only wastes time and is not needed.
+    params=${params//--enable_macsec/}
+    if [[ x"${BSL}" == x"True" ]]; then
+        params="${params} --ignore=bgp --skip_sanity"
+    fi
+    echo $params
+}
+
 function prepare_dut()
 {
     echo "=== Preparing DUT for subsequent tests ==="
-    pytest ${PYTEST_UTIL_OPTS} ${PRET_LOGGING_OPTIONS} ${UTIL_TOPOLOGY_OPTIONS} ${EXTRA_PARAMETERS} -m pretest
+    echo Running: python3 -m pytest ${PYTEST_UTIL_OPTS} ${PRET_LOGGING_OPTIONS} ${UTIL_TOPOLOGY_OPTIONS} $(pre_post_extra_params) -m pretest
+    python3 -m pytest ${PYTEST_UTIL_OPTS} ${PRET_LOGGING_OPTIONS} ${UTIL_TOPOLOGY_OPTIONS} $(pre_post_extra_params) -m pretest
 }
 
 function cleanup_dut()
 {
     echo "=== Cleaning up DUT after tests ==="
-    pytest ${PYTEST_UTIL_OPTS} ${POST_LOGGING_OPTIONS} ${UTIL_TOPOLOGY_OPTIONS} ${EXTRA_PARAMETERS} -m posttest
+    echo Running: python3 -m pytest ${PYTEST_UTIL_OPTS} ${POST_LOGGING_OPTIONS} ${UTIL_TOPOLOGY_OPTIONS} $(pre_post_extra_params) -m posttest
+    python3 -m pytest ${PYTEST_UTIL_OPTS} ${POST_LOGGING_OPTIONS} ${UTIL_TOPOLOGY_OPTIONS} $(pre_post_extra_params) -m posttest
 }
 
 function run_group_tests()
 {
     echo "=== Running tests in groups ==="
-    pytest ${TEST_CASES} ${PYTEST_COMMON_OPTS} ${TEST_LOGGING_OPTIONS} ${TEST_TOPOLOGY_OPTIONS} ${EXTRA_PARAMETERS}
+    echo Running: python3 -m pytest ${TEST_CASES} ${PYTEST_COMMON_OPTS} ${TEST_LOGGING_OPTIONS} ${TEST_TOPOLOGY_OPTIONS} ${EXTRA_PARAMETERS}
+    python3 -m pytest ${TEST_CASES} ${PYTEST_COMMON_OPTS} ${TEST_LOGGING_OPTIONS} ${TEST_TOPOLOGY_OPTIONS} ${EXTRA_PARAMETERS} --cache-clear
 }
 
 function run_individual_tests()
 {
     EXIT_CODE=0
+
+    CACHE_CLEAR="--cache-clear"
 
     echo "=== Running tests individually ==="
     for test_script in ${TEST_CASES}; do
@@ -274,8 +329,14 @@ function run_individual_tests()
             TEST_LOGGING_OPTIONS="--log-file ${LOG_PATH}/${test_dir}/${test_name}.log --junitxml=${LOG_PATH}/${test_dir}/${test_name}.xml"
         fi
 
-        pytest ${test_script} ${PYTEST_COMMON_OPTS} ${TEST_LOGGING_OPTIONS} ${TEST_TOPOLOGY_OPTIONS} ${EXTRA_PARAMETERS}
+        echo Running: python3 -m pytest ${test_script} ${PYTEST_COMMON_OPTS} ${TEST_LOGGING_OPTIONS} ${TEST_TOPOLOGY_OPTIONS} ${EXTRA_PARAMETERS}
+        python3 -m pytest ${test_script} ${PYTEST_COMMON_OPTS} ${TEST_LOGGING_OPTIONS} ${TEST_TOPOLOGY_OPTIONS} ${EXTRA_PARAMETERS} ${CACHE_CLEAR}
         ret_code=$?
+
+        # Clear pytest cache for the first run
+        if [[ -n ${CACHE_CLEAR} ]]; then
+            CACHE_CLEAR=""
+        fi
 
         # If test passed, no need to keep its log.
         if [ ${ret_code} -eq 0 ]; then
@@ -283,6 +344,17 @@ function run_individual_tests()
                 rm -f ${LOG_PATH}/${test_dir}/${test_name}.log
             fi
         else
+            # rc 10 means pre-test sanity check failed, rc 12 means boths pre-test and post-test sanity check failed
+            if [ ${ret_code} -eq 10 ] || [ ${ret_code} -eq 12 ]; then
+                echo "=== Sanity check failed for $test_script. Skip rest of the scripts if there is any. ==="
+                return ${ret_code}
+            fi
+            # rc 15 means duthosts fixture failed
+            if [ ${ret_code} -eq 15 ]; then
+                echo "=== duthosts fixture failed for $test_script. Skip rest of the scripts if there is any. ==="
+                return ${ret_code}
+            fi
+
             EXIT_CODE=1
             if [[ ${TEST_MAX_FAIL} != 0 ]]; then
                 return ${EXIT_CODE}
@@ -294,10 +366,17 @@ function run_individual_tests()
     return ${EXIT_CODE}
 }
 
+function run_bsl_tests()
+{
+    echo "=== Running BSL tests ==="
+    echo Running: python3 -m pytest ${PYTEST_COMMON_OPTS} --skip_sanity --disable_loganalyzer --junit-xml=logs/bsl.xml --log-file logs/bsl.log -m bsl
+    python3 -m pytest ${PYTEST_COMMON_OPTS} --skip_sanity --disable_loganalyzer --junit-xml=logs/bsl.xml --log-file logs/bsl.log -m bsl
+}
+
 setup_environment
 
 
-while getopts "h?a:b:c:d:e:Ef:i:I:k:l:m:n:oOp:q:rs:S:t:ux" opt; do
+while getopts "h?a:b:Bc:C:d:e:Ef:F:i:I:k:l:m:n:oOp:q:rs:S:t:ux" opt; do
     case ${opt} in
         h|\? )
             show_help_and_exit 0
@@ -309,8 +388,14 @@ while getopts "h?a:b:c:d:e:Ef:i:I:k:l:m:n:oOp:q:rs:S:t:ux" opt; do
             KUBE_MASTER_ID=${OPTARG}
             SKIP_FOLDERS=${SKIP_FOLDERS//k8s/}
             ;;
+        B )
+	    BSL="True"
+	    ;;
         c )
             TEST_CASES="${TEST_CASES} ${OPTARG}"
+            ;;
+        C )
+            TEST_FILTER="${TEST_FILTER} ${OPTARG}"
             ;;
         d )
             DUT_NAME=${OPTARG}
@@ -323,6 +408,9 @@ while getopts "h?a:b:c:d:e:Ef:i:I:k:l:m:n:oOp:q:rs:S:t:ux" opt; do
             ;;
         f )
             TESTBED_FILE=${OPTARG}
+            ;;
+        F )
+            TEST_CASES_FILE="${OPTARG}"
             ;;
         i )
             INVENTORY=${OPTARG}
@@ -389,12 +477,20 @@ if [[ x"${TEST_METHOD}" != x"debug" && x"${BYPASS_UTIL}" == x"False" ]]; then
         echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
         echo "!!!!!  Prepare DUT failed, skip testing  !!!!!"
         echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        exit ${RESULT}
+        # exit with specific code 65 for pretest failed.
+        # user-defined exit codes is the range 64 - 113.
+        # nightly test pipeline can check this code to decide if fails pipeline.
+        exit 65
     fi
 fi
 
 RC=0
-run_${TEST_METHOD}_tests || RC=$?
+
+if [[ x"${BSL}" == x"True" ]]; then
+    run_bsl_tests || RC=$?
+else
+    run_${TEST_METHOD}_tests || RC=$?
+fi
 
 if [[ x"${TEST_METHOD}" != x"debug" && x"${BYPASS_UTIL}" == x"False" ]]; then
     cleanup_dut
